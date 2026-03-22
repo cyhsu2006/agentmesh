@@ -322,6 +322,14 @@ if tasks: print(json.dumps(tasks[0]))
 
 $(cat "$SPECS_DIR/$spec_file")
 
+IMPORTANT: Progress reporting requirement:
+- You have access to a notification tool: ~/bin/agentmesh-notify
+- Every 30 minutes of work, or after completing a major step, report progress by running:
+  ~/bin/agentmesh-notify --event task_start \"進度回報：<describe current progress>\"
+- Example: ~/bin/agentmesh-notify --event task_start \"進度回報：模型下載完成，開始生成 batch 1/4\"
+- This sends a Telegram notification to the user so they can monitor your progress.
+- Always report before starting a long-running process (e.g. training, generation).
+
 Execute the task as described. When done, summarize what you did."
     else
         full_prompt=$(python3 -c "
@@ -363,7 +371,7 @@ for t in data['tasks']:
 
     local output_file="/tmp/agentmesh-task-${task_id}.json"
     local exit_code=0
-    timeout 3600 claude -p "$full_prompt" \
+    claude -p "$full_prompt" \
         --model "$model" \
         --max-budget-usd "$budget" \
         --permission-mode bypassPermissions \
