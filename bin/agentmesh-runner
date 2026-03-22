@@ -167,6 +167,94 @@ print('\n'.join(cmd_lines).strip())
     done
 }
 
+# --- Artifact Collection ---
+collect_artifacts() {
+    local task_id="$1"
+    local task_json="$2"
+
+    local output_dir
+    output_dir=$(get_task_field "$task_json" "output_dir" "")
+    [ -z "$output_dir" ] && return 0
+
+    output_dir="${output_dir/#\~/$HOME}"
+    [ ! -d "$output_dir" ] && return 0
+
+    local artifacts_dir="$MEMORY_DIR/artifacts"
+    local target_dir="$artifacts_dir/$task_id"
+    local registry="$artifacts_dir/registry.json"
+
+    mkdir -p "$target_dir"
+
+    local total_size=0
+    local max_total=$((50 * 1024 * 1024))
+    local max_file=$((10 * 1024 * 1024))
+
+    while IFS= read -r file; do
+        local size
+        size=$(stat -c %s "$file" 2>/dev/null || echo 0)
+        [ "$size" -gt "$max_file" ] && continue
+        [ $((total_size + size)) -gt "$max_total" ] && break
+        local rel_path="${file#$output_dir/}"
+        mkdir -p "$target_dir/$(dirname "$rel_path")"
+        cp "$file" "$target_dir/$rel_path"
+        total_size=$((total_size + size))
+    done < <(find "$output_dir" -type f 2>/dev/null | sort)
+
+    [ "$total_size" -eq 0 ] && return 0
+
+    local title
+    title=$(get_task_field "$task_json" "title" "$task_id")
+
+    python3 << PYEOF
+import json, os
+from datetime import datetime, timezone, timedelta
+tz = timezone(timedelta(hours=8))
+
+registry_path = "$registry"
+if os.path.isfile(registry_path):
+    with open(registry_path) as f:
+        registry = json.load(f)
+else:
+    registry = {"artifacts": []}
+
+registry["artifacts"] = [a for a in registry["artifacts"] if a["id"] != "$task_id"]
+
+files = []
+for root, dirs, fnames in os.walk("$target_dir"):
+    for fname in fnames:
+        full = os.path.join(root, fname)
+        rel = os.path.relpath(full, "$target_dir")
+        size = os.path.getsize(full)
+        files.append({"path": rel, "size": size})
+
+summary = ""
+try:
+    with open("$TASKS_FILE") as f:
+        data = json.load(f)
+    for t in data["tasks"]:
+        if t["id"] == "$task_id":
+            summary = t.get("summary", "")[:200]
+            break
+except: pass
+
+registry["artifacts"].append({
+    "id": "$task_id",
+    "task_id": "$task_id",
+    "title": """$title""",
+    "files": files,
+    "created_by": "$HOSTNAME",
+    "created_at": datetime.now(tz).isoformat(),
+    "total_size": $total_size,
+    "description": summary
+})
+
+with open(registry_path, "w") as f:
+    json.dump(registry, f, indent=2, ensure_ascii=False)
+PYEOF
+
+    log "ARTIFACT collected $task_id: $total_size bytes"
+}
+
 # --- Task Processing ---
 process_tasks() {
     [ ! -f "$TASKS_FILE" ] && return 0
@@ -287,6 +375,7 @@ with open("$TASKS_FILE", "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
 PYEOF
         log "DONE task $task_id"
+        collect_artifacts "$task_id" "$next_task"
     else
         update_task "$task_id" "{\"status\":\"failed\",\"error\":\"exit code $exit_code\"}"
         log "FAIL task $task_id (exit=$exit_code)"
