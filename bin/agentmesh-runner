@@ -349,9 +349,14 @@ for t in data['tasks']:
     update_task "$task_id" "{\"status\":\"running\",\"pid\":$$}"
     push_results
 
+    if [ ! -d "$project_dir" ]; then
+        log "Directory not found: $project_dir, creating it"
+        mkdir -p "$project_dir"
+        notify task_start "自動建立目錄：$project_dir"
+    fi
     cd "$project_dir" || {
         update_task "$task_id" "{\"status\":\"failed\",\"error\":\"Directory not found: $project_dir\"}"
-        notify task_fail "任務失敗：$title — 目錄不存在：$project_dir"
+        notify task_fail "任務失敗：$title — 無法進入目錄：$project_dir"
         push_results
         return
     }
