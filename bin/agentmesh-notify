@@ -1,0 +1,99 @@
+#!/bin/bash
+# agentmesh-notify — Send notifications to Telegram
+# Usage: agentmesh-notify "message"
+#        agentmesh-notify --event <type> "message"
+set -euo pipefail
+
+HOSTNAME=$(hostname)
+CONFIG_DIR="$HOME/.agentmesh"
+TG_CONFIG="$CONFIG_DIR/telegram.json"
+
+# Fallback: read from Claude's Telegram channel config
+if [ ! -f "$TG_CONFIG" ]; then
+    TG_ENV="$HOME/.claude/channels/telegram/.env"
+    if [ -f "$TG_ENV" ]; then
+        BOT_TOKEN=$(grep 'TELEGRAM_BOT_TOKEN' "$TG_ENV" | cut -d= -f2)
+    else
+        echo "ERROR: No Telegram config found. Run 'agentmesh-notify --setup' first." >&2
+        exit 1
+    fi
+    CHAT_ID=""
+    # Try to read chat_id from access.json
+    ACCESS_JSON="$HOME/.claude/channels/telegram/access.json"
+    if [ -f "$ACCESS_JSON" ]; then
+        CHAT_ID=$(python3 -c "
+import json
+with open('$ACCESS_JSON') as f:
+    data = json.load(f)
+ids = data.get('allowFrom', [])
+if ids: print(ids[0])
+" 2>/dev/null || echo "")
+    fi
+else
+    BOT_TOKEN=$(python3 -c "import json; print(json.load(open('$TG_CONFIG'))['bot_token'])")
+    CHAT_ID=$(python3 -c "import json; print(json.load(open('$TG_CONFIG'))['chat_id'])")
+fi
+
+if [ -z "$BOT_TOKEN" ]; then
+    echo "ERROR: Bot token not found." >&2
+    exit 1
+fi
+
+if [ -z "$CHAT_ID" ]; then
+    echo "ERROR: Chat ID not found." >&2
+    exit 1
+fi
+
+# Parse arguments
+EVENT=""
+MESSAGE=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --event) EVENT="$2"; shift 2 ;;
+        --setup)
+            echo "Setting up Telegram notifications..."
+            mkdir -p "$CONFIG_DIR"
+            read -p "Bot Token: " setup_token
+            read -p "Chat ID: " setup_chat
+            cat > "$TG_CONFIG" << JSONEOF
+{
+  "bot_token": "$setup_token",
+  "chat_id": "$setup_chat"
+}
+JSONEOF
+            chmod 600 "$TG_CONFIG"
+            echo "Saved to $TG_CONFIG"
+            exit 0
+            ;;
+        *) MESSAGE="$1"; shift ;;
+    esac
+done
+
+if [ -z "$MESSAGE" ]; then
+    echo "Usage: agentmesh-notify [--event <type>] \"message\"" >&2
+    exit 1
+fi
+
+# Event emoji prefix
+PREFIX=""
+case "${EVENT:-}" in
+    broadcast_received)  PREFIX="📥" ;;
+    broadcast_done)      PREFIX="✅" ;;
+    task_start)          PREFIX="🚀" ;;
+    task_done)           PREFIX="✅" ;;
+    task_fail)           PREFIX="❌" ;;
+    sync_error)          PREFIX="⚠️" ;;
+    ask)                 PREFIX="❓" ;;
+    *)                   PREFIX="💬" ;;
+esac
+
+# Format message with hostname
+FULL_MESSAGE="${PREFIX} [${HOSTNAME}] ${MESSAGE}"
+
+# Send via Telegram Bot API
+curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${CHAT_ID}" \
+    -d "text=${FULL_MESSAGE}" \
+    -d "parse_mode=HTML" \
+    > /dev/null 2>&1 || true

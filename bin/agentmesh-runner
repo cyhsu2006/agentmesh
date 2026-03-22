@@ -24,6 +24,17 @@ BROADCASTS_DIR="$MEMORY_DIR/broadcasts"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$HOSTNAME] $*" >> "$LOG"; }
 
+# Telegram notification helper
+notify() {
+    local event="${1:-}"
+    local message="${2:-}"
+    if command -v agentmesh-notify &>/dev/null; then
+        agentmesh-notify --event "$event" "$message" &
+    elif [ -x "$HOME/bin/agentmesh-notify" ]; then
+        "$HOME/bin/agentmesh-notify" --event "$event" "$message" &
+    fi
+}
+
 acquire_lock() {
     if [ -f "$LOCK_FILE" ]; then
         local pid
@@ -129,6 +140,7 @@ print('\n'.join(cmd_lines).strip())
         fi
 
         log "BROADCAST $(basename "$bc_file"): executing"
+        notify broadcast_received "收到廣播：$(head -1 "$bc_file" | sed 's/^# //')"
 
         local model budget project_dir
         model=$(grep '^model:' "$bc_file" | head -1 | sed 's/model: *//' || echo "sonnet")
@@ -157,9 +169,11 @@ print('\n'.join(cmd_lines).strip())
         if [ $exit_code -eq 0 ]; then
             sed -i "s/^- \[ \] $HOSTNAME.*/- [x] $HOSTNAME ($timestamp)/" "$bc_file"
             log "BROADCAST $(basename "$bc_file"): completed"
+            notify broadcast_done "廣播完成：$(head -1 "$bc_file" | sed 's/^# //')"
         else
             sed -i "s/^- \[ \] $HOSTNAME.*/- [!] $HOSTNAME ($timestamp) exit=$exit_code/" "$bc_file"
             log "BROADCAST $(basename "$bc_file"): failed (exit=$exit_code)"
+            notify task_fail "廣播失敗：$(head -1 "$bc_file" | sed 's/^# //') (exit=$exit_code)"
         fi
 
         push_results
@@ -327,7 +341,10 @@ for t in data['tasks']:
         return
     fi
 
+    local title
+    title=$(get_task_field "$next_task" "title" "$task_id")
     log "EXEC task $task_id in $project_dir"
+    notify task_start "開始任務：$title"
     update_task "$task_id" "{\"status\":\"running\",\"pid\":$$}"
     push_results
 
@@ -375,10 +392,12 @@ with open("$TASKS_FILE", "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
 PYEOF
         log "DONE task $task_id"
+        notify task_done "任務完成：$title"
         collect_artifacts "$task_id" "$next_task"
     else
         update_task "$task_id" "{\"status\":\"failed\",\"error\":\"exit code $exit_code\"}"
         log "FAIL task $task_id (exit=$exit_code)"
+        notify task_fail "任務失敗：$title (exit=$exit_code)"
     fi
     push_results
 }

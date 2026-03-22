@@ -1,0 +1,140 @@
+#!/bin/bash
+# agentmesh-ask — Ask user a question via Telegram and wait for reply
+# Usage: agentmesh-ask "question" [--timeout 300]
+# Returns: user's reply text on stdout
+# Exit code: 0 = got reply, 1 = timeout/error
+set -euo pipefail
+
+HOSTNAME=$(hostname)
+CONFIG_DIR="$HOME/.agentmesh"
+TG_CONFIG="$CONFIG_DIR/telegram.json"
+
+# Read Telegram config (same logic as agentmesh-notify)
+if [ ! -f "$TG_CONFIG" ]; then
+    TG_ENV="$HOME/.claude/channels/telegram/.env"
+    if [ -f "$TG_ENV" ]; then
+        BOT_TOKEN=$(grep 'TELEGRAM_BOT_TOKEN' "$TG_ENV" | cut -d= -f2)
+    else
+        echo "ERROR: No Telegram config found." >&2
+        exit 1
+    fi
+    CHAT_ID=""
+    ACCESS_JSON="$HOME/.claude/channels/telegram/access.json"
+    if [ -f "$ACCESS_JSON" ]; then
+        CHAT_ID=$(python3 -c "
+import json
+with open('$ACCESS_JSON') as f:
+    data = json.load(f)
+ids = data.get('allowFrom', [])
+if ids: print(ids[0])
+" 2>/dev/null || echo "")
+    fi
+else
+    BOT_TOKEN=$(python3 -c "import json; print(json.load(open('$TG_CONFIG'))['bot_token'])")
+    CHAT_ID=$(python3 -c "import json; print(json.load(open('$TG_CONFIG'))['chat_id'])")
+fi
+
+if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+    echo "ERROR: Bot token or Chat ID not found." >&2
+    exit 1
+fi
+
+# Parse arguments
+QUESTION=""
+TIMEOUT=300  # default 5 minutes
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --timeout) TIMEOUT="$2"; shift 2 ;;
+        *) QUESTION="$1"; shift ;;
+    esac
+done
+
+if [ -z "$QUESTION" ]; then
+    echo "Usage: agentmesh-ask \"question\" [--timeout 300]" >&2
+    exit 1
+fi
+
+# Get current update_id to know where to start polling
+LAST_UPDATE=$(curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=-1" | \
+    python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+results = data.get('result', [])
+if results:
+    print(results[-1]['update_id'] + 1)
+else:
+    print(0)
+" 2>/dev/null || echo "0")
+
+# Send question
+FULL_QUESTION="❓ [${HOSTNAME}] ${QUESTION}
+
+(請直接回覆此訊息)"
+
+SENT_MSG=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${CHAT_ID}" \
+    -d "text=${FULL_QUESTION}" \
+    -d "parse_mode=HTML" 2>/dev/null)
+
+SENT_MSG_ID=$(echo "$SENT_MSG" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('result', {}).get('message_id', 0))
+" 2>/dev/null || echo "0")
+
+# Poll for reply
+ELAPSED=0
+POLL_INTERVAL=5
+
+while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+    sleep "$POLL_INTERVAL"
+    ELAPSED=$((ELAPSED + POLL_INTERVAL))
+
+    UPDATES=$(curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${LAST_UPDATE}&timeout=1" 2>/dev/null)
+
+    REPLY=$(echo "$UPDATES" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for update in data.get('result', []):
+    msg = update.get('message', {})
+    # Check if it's from our chat and is a reply to our question
+    if str(msg.get('chat', {}).get('id', '')) == '$CHAT_ID':
+        reply_to = msg.get('reply_to_message', {})
+        text = msg.get('text', '')
+        if text:
+            # Accept if it's a reply to our message, or any new message
+            if reply_to.get('message_id') == $SENT_MSG_ID or not reply_to:
+                print(text)
+                break
+" 2>/dev/null || echo "")
+
+    if [ -n "$REPLY" ]; then
+        # Acknowledge receipt
+        curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            -d "text=👍 [${HOSTNAME}] 收到回覆，繼續執行。" \
+            > /dev/null 2>&1 || true
+        echo "$REPLY"
+        exit 0
+    fi
+
+    # Update offset to avoid re-reading
+    NEW_OFFSET=$(echo "$UPDATES" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+results = data.get('result', [])
+if results:
+    print(results[-1]['update_id'] + 1)
+else:
+    print($LAST_UPDATE)
+" 2>/dev/null || echo "$LAST_UPDATE")
+    LAST_UPDATE="$NEW_OFFSET"
+done
+
+# Timeout
+curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${CHAT_ID}" \
+    -d "text=⏰ [${HOSTNAME}] 等待回覆超時（${TIMEOUT}秒），將使用預設值繼續。" \
+    > /dev/null 2>&1 || true
+exit 1
