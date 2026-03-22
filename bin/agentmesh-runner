@@ -337,6 +337,7 @@ for t in data['tasks']:
 
     if [ -z "$full_prompt" ]; then
         update_task "$task_id" '{"status":"failed","error":"No spec file or prompt found"}'
+        notify task_fail "任務失敗：$task_id — 找不到規格書或 prompt"
         push_results
         return
     fi
@@ -350,6 +351,7 @@ for t in data['tasks']:
 
     cd "$project_dir" || {
         update_task "$task_id" "{\"status\":\"failed\",\"error\":\"Directory not found: $project_dir\"}"
+        notify task_fail "任務失敗：$title — 目錄不存在：$project_dir"
         push_results
         return
     }
