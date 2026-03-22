@@ -1,0 +1,39 @@
+#!/bin/bash
+# agentmesh — AgentMesh CLI 入口
+# Usage: agentmesh <command> [args]
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VERSION="0.1.0"
+
+usage() {
+    cat << 'EOF'
+AgentMesh — Cloud-Synchronized Distributed AI Agent Framework
+
+Usage: agentmesh <command> [args]
+
+Commands:
+  init              Create a new mesh (first machine)
+  join <token>      Join an existing mesh
+  sync [pull|push|full]  Sync memory, settings, and tasks (default: full)
+  task <subcommand> Task management (list, add, run)
+  broadcast <file>  Send a broadcast to all machines
+  status            Show mesh status
+  version           Show version
+
+Run 'agentmesh <command> --help' for more information.
+EOF
+}
+
+case "${1:-}" in
+    init)       shift; bash "$SCRIPT_DIR/agentmesh-init" "$@" ;;
+    join)       shift; bash "$SCRIPT_DIR/agentmesh-join" "$@" ;;
+    sync)       shift; bash "$SCRIPT_DIR/agentmesh-sync" "$@" ;;
+    runner)     shift; bash "$SCRIPT_DIR/agentmesh-runner" "$@" ;;
+    task)       shift; bash "$SCRIPT_DIR/agentmesh-task" "$@" ;;
+    broadcast)  shift; bash "$SCRIPT_DIR/agentmesh-broadcast" "$@" ;;
+    status)     shift; bash "$SCRIPT_DIR/agentmesh-status" "$@" ;;
+    version)    echo "AgentMesh v$VERSION" ;;
+    -h|--help|"") usage ;;
+    *)          echo "Unknown command: $1"; usage; exit 1 ;;
+esac

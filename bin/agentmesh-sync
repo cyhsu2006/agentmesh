@@ -1,0 +1,189 @@
+#!/bin/bash
+# agentmesh-sync — Sync memory, settings, tasks across the mesh
+# Usage: agentmesh sync [pull|push|full]
+set -euo pipefail
+
+HOSTNAME=$(hostname)
+CONFIG_DIR="$HOME/.agentmesh"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+LOG="/tmp/agentmesh.log"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: AgentMesh not configured. Run 'agentmesh init' or 'agentmesh join' first."
+    exit 1
+fi
+
+# Read config
+MEMORY_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['memory_dir'])")
+RCLONE_CONF=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['rclone_conf'])")
+REMOTE=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['remote'])")
+
+LOCK_FILE="/tmp/agentmesh-sync.lock"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$HOSTNAME] $*" >> "$LOG"; }
+
+get_mtime() {
+    if stat -c %Y "$1" 2>/dev/null; then return; fi
+    stat -f %m "$1" 2>/dev/null || echo 0
+}
+
+acquire_lock() {
+    if [ -f "$LOCK_FILE" ]; then
+        local pid
+        pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            log "SKIP: sync already running (pid=$pid)"
+            exit 0
+        fi
+        rm -f "$LOCK_FILE"
+    fi
+    echo $$ > "$LOCK_FILE"
+    trap 'rm -f "$LOCK_FILE"' EXIT
+}
+
+pull_memory() {
+    log "PULL memory from cloud"
+    mkdir -p "$MEMORY_DIR"
+    rclone copy "$REMOTE:memory/" "$MEMORY_DIR/" \
+        --update \
+        --config "$RCLONE_CONF" \
+        --log-file "$LOG" --log-level INFO
+    log "PULL memory done"
+}
+
+push_memory() {
+    log "PUSH memory to cloud"
+    mkdir -p "$MEMORY_DIR"
+    local file_count
+    file_count=$(find "$MEMORY_DIR" -type f \( -name '*.md' -o -name '*.json' \) 2>/dev/null | wc -l)
+    if [ "$file_count" -eq 0 ]; then
+        log "WARN: local memory empty, skip push"
+        return 0
+    fi
+    rclone copy "$MEMORY_DIR/" "$REMOTE:memory/" \
+        --update \
+        --config "$RCLONE_CONF" \
+        --log-file "$LOG" --log-level INFO
+    log "PUSH memory done (files=$file_count)"
+}
+
+pull_settings() {
+    log "PULL settings from cloud"
+    local settings_file="$HOME/.claude/settings.json"
+    local cloud_tmp="/tmp/agentmesh-settings-$$.json"
+    if rclone copyto "$REMOTE:settings/settings.json" "$cloud_tmp" --config "$RCLONE_CONF" 2>>"$LOG"; then
+        if [ -f "$settings_file" ]; then
+            local cloud_mtime local_mtime
+            cloud_mtime=$(get_mtime "$cloud_tmp" 2>/dev/null || echo 0)
+            local_mtime=$(get_mtime "$settings_file" 2>/dev/null || echo 0)
+            if [ "$cloud_mtime" -gt "$local_mtime" ]; then
+                cp "$cloud_tmp" "$settings_file"
+                log "PULL settings: cloud is newer, updated"
+            else
+                log "PULL settings: local is newer, skip"
+            fi
+        else
+            cp "$cloud_tmp" "$settings_file"
+            log "PULL settings: local missing, copied from cloud"
+        fi
+        rm -f "$cloud_tmp"
+    else
+        log "PULL settings: no cloud settings, skip"
+        rm -f "$cloud_tmp"
+    fi
+}
+
+push_settings() {
+    local settings_file="$HOME/.claude/settings.json"
+    [ ! -f "$settings_file" ] && return 0
+    log "PUSH settings to cloud"
+    local cloud_tmp="/tmp/agentmesh-settings-check-$$.json"
+    local should_push=true
+    if rclone copyto "$REMOTE:settings/settings.json" "$cloud_tmp" --config "$RCLONE_CONF" 2>>"$LOG"; then
+        local cloud_mtime local_mtime
+        cloud_mtime=$(get_mtime "$cloud_tmp" 2>/dev/null || echo 0)
+        local_mtime=$(get_mtime "$settings_file" 2>/dev/null || echo 0)
+        if [ "$local_mtime" -le "$cloud_mtime" ]; then
+            should_push=false
+        fi
+        rm -f "$cloud_tmp"
+    else
+        rm -f "$cloud_tmp"
+    fi
+    if [ "$should_push" = true ]; then
+        rclone copyto "$settings_file" "$REMOTE:settings/settings.json" --config "$RCLONE_CONF" 2>>"$LOG"
+        log "PUSH settings done"
+    fi
+}
+
+push_logs() {
+    log "PUSH logs for $HOSTNAME"
+    rclone sync "$HOME/.claude/projects/" "$REMOTE:logs/$HOSTNAME/" \
+        --exclude "*/memory/**" \
+        --exclude "*.tmp" \
+        --config "$RCLONE_CONF" \
+        --log-file "$LOG" --log-level INFO
+}
+
+self_update() {
+    # Check if agentmesh repo exists locally for self-update
+    local repo=""
+    for d in "$HOME/Projects/agentmesh" "$HOME/agentmesh"; do
+        if [ -d "$d/.git" ]; then repo="$d"; break; fi
+    done
+    [ -z "$repo" ] && return 0
+
+    log "SELF-UPDATE: git pull in $repo"
+    local before after
+    before=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo "")
+    git -C "$repo" pull --ff-only -q 2>>"$LOG" || {
+        log "SELF-UPDATE: git pull failed, skip"
+        return 0
+    }
+    after=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo "")
+
+    if [ "$before" != "$after" ]; then
+        log "SELF-UPDATE: repo updated ($before → $after)"
+        mkdir -p "$HOME/bin"
+        for script in "$repo/bin/"*; do
+            [ -f "$script" ] || continue
+            cp "$script" "$HOME/bin/$(basename "$script")"
+            chmod +x "$HOME/bin/$(basename "$script")"
+            log "SELF-UPDATE: installed $(basename "$script")"
+        done
+    fi
+}
+
+# Main
+case "${1:-full}" in
+    pull)
+        acquire_lock
+        pull_settings
+        pull_memory
+        ;;
+    push)
+        acquire_lock
+        push_memory
+        push_settings
+        push_logs
+        ;;
+    full)
+        acquire_lock
+        self_update
+        pull_settings
+        pull_memory
+        push_memory
+        push_settings
+        push_logs
+        # Trigger task runner
+        if command -v agentmesh-runner &>/dev/null; then
+            agentmesh-runner >> /tmp/agentmesh-runner.log 2>&1 &
+        elif [ -x "$HOME/bin/agentmesh-runner" ]; then
+            "$HOME/bin/agentmesh-runner" >> /tmp/agentmesh-runner.log 2>&1 &
+        fi
+        ;;
+    *)
+        echo "Usage: agentmesh sync [pull|push|full]"
+        exit 1
+        ;;
+esac

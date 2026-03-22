@@ -1,0 +1,185 @@
+#!/bin/bash
+# agentmesh-init — Create a new AgentMesh network
+# Sets up Google Drive + rclone crypt, generates join token
+set -euo pipefail
+
+HOSTNAME=$(hostname)
+CONFIG_DIR="$HOME/.agentmesh"
+RCLONE_CONF="$CONFIG_DIR/rclone.conf"
+
+echo "=== AgentMesh Init ==="
+echo "Creating a new AgentMesh network on: $HOSTNAME"
+echo ""
+
+# Check dependencies
+for cmd in rclone claude python3; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "ERROR: '$cmd' is required but not installed."
+        exit 1
+    fi
+done
+
+# Create config directory
+mkdir -p "$CONFIG_DIR"
+
+# Step 1: Configure Google Drive via rclone
+echo "--- Step 1: Google Drive Setup ---"
+if rclone listremotes --config "$RCLONE_CONF" 2>/dev/null | grep -q "^agentmesh-base:"; then
+    echo "Google Drive remote 'agentmesh-base' already exists."
+    read -p "Reconfigure? [y/N] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        rclone config delete agentmesh-base --config "$RCLONE_CONF" 2>/dev/null || true
+        rclone config create agentmesh-base drive --config "$RCLONE_CONF"
+    fi
+else
+    echo "Setting up Google Drive access..."
+    echo "A browser window will open for authentication."
+    echo ""
+    rclone config create agentmesh-base drive --config "$RCLONE_CONF"
+fi
+
+# Test connection
+echo "Testing Google Drive connection..."
+if ! rclone lsd agentmesh-base: --config "$RCLONE_CONF" &>/dev/null; then
+    echo "ERROR: Cannot connect to Google Drive. Please check your setup."
+    exit 1
+fi
+echo "✓ Google Drive connected."
+echo ""
+
+# Step 2: Generate encryption keys
+echo "--- Step 2: Encryption Setup ---"
+CRYPT_PASSWORD=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+CRYPT_PASSWORD2=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+
+# Create encrypted remote
+rclone config delete agentmesh --config "$RCLONE_CONF" 2>/dev/null || true
+rclone config create agentmesh crypt \
+    remote="agentmesh-base:agentmesh-data" \
+    password="$CRYPT_PASSWORD" \
+    password2="$CRYPT_PASSWORD2" \
+    --config "$RCLONE_CONF"
+
+echo "✓ Encrypted remote 'agentmesh' created."
+echo ""
+
+# Step 3: Initialize mesh directory structure on cloud
+echo "--- Step 3: Initializing Cloud Storage ---"
+MESH_ID=$(python3 -c "import secrets; print(secrets.token_hex(8))")
+CREATED_AT=$(date -Iseconds)
+
+# Create mesh metadata
+cat > "$CONFIG_DIR/mesh.json" << JSONEOF
+{
+  "mesh_id": "$MESH_ID",
+  "created_at": "$CREATED_AT",
+  "created_by": "$HOSTNAME",
+  "version": "0.1.0"
+}
+JSONEOF
+
+# Upload mesh metadata
+rclone copyto "$CONFIG_DIR/mesh.json" "agentmesh:mesh.json" --config "$RCLONE_CONF"
+echo "✓ Mesh initialized (ID: $MESH_ID)"
+echo ""
+
+# Step 4: Setup local environment
+echo "--- Step 4: Local Environment Setup ---"
+
+# Detect memory directory
+SANITIZED_HOME=$(echo "$HOME" | sed 's|/|-|g; s|^-||')
+MEMORY_DIR="$HOME/.claude/projects/$SANITIZED_HOME/memory"
+if [ ! -d "$MEMORY_DIR" ]; then
+    FOUND=$(find "$HOME/.claude/projects" -maxdepth 2 -name "memory" -type d 2>/dev/null | head -1)
+    if [ -n "$FOUND" ]; then
+        MEMORY_DIR="$FOUND"
+    else
+        mkdir -p "$MEMORY_DIR"
+    fi
+fi
+
+# Save local config
+cat > "$CONFIG_DIR/config.json" << JSONEOF
+{
+  "hostname": "$HOSTNAME",
+  "mesh_id": "$MESH_ID",
+  "memory_dir": "$MEMORY_DIR",
+  "rclone_conf": "$RCLONE_CONF",
+  "remote": "agentmesh",
+  "sync_interval_min": 60,
+  "installed_at": "$CREATED_AT"
+}
+JSONEOF
+
+# Create machine directory
+mkdir -p "$MEMORY_DIR/machines/$HOSTNAME"
+mkdir -p "$MEMORY_DIR/broadcasts"
+mkdir -p "$MEMORY_DIR/tasks"
+
+# Install scripts to ~/bin
+mkdir -p "$HOME/bin"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+for script in "$SCRIPT_DIR"/agentmesh*; do
+    [ -f "$script" ] || continue
+    cp "$script" "$HOME/bin/"
+    chmod +x "$HOME/bin/$(basename "$script")"
+done
+echo "✓ Scripts installed to ~/bin/"
+
+# Setup cron
+CRON_CMD="0 * * * * $HOME/bin/agentmesh sync full >> /tmp/agentmesh.log 2>&1"
+if crontab -l 2>/dev/null | grep -q "agentmesh sync"; then
+    echo "✓ Cron already configured."
+else
+    (crontab -l 2>/dev/null || true; echo "$CRON_CMD") | crontab -
+    echo "✓ Cron job added (hourly sync)."
+fi
+echo ""
+
+# Step 5: Generate join token
+echo "--- Step 5: Join Token ---"
+JOIN_DATA=$(python3 -c "
+import json, base64
+data = {
+    'mesh_id': '$MESH_ID',
+    'crypt_password': '$CRYPT_PASSWORD',
+    'crypt_password2': '$CRYPT_PASSWORD2',
+    'base_remote_type': 'drive',
+    'cloud_path': 'agentmesh-data',
+    'created_by': '$HOSTNAME',
+    'created_at': '$CREATED_AT'
+}
+token = base64.urlsafe_b64encode(json.dumps(data).encode()).decode()
+print(token)
+")
+
+echo "Share this token with other machines to join the mesh:"
+echo ""
+echo "  agentmesh join $JOIN_DATA"
+echo ""
+echo "⚠️  Keep this token private! It contains encryption keys."
+echo "    Share only through secure channels (in person, encrypted messaging)."
+echo ""
+
+# Save token locally for reference
+echo "$JOIN_DATA" > "$CONFIG_DIR/join-token.txt"
+chmod 600 "$CONFIG_DIR/join-token.txt"
+echo "Token also saved to: $CONFIG_DIR/join-token.txt"
+echo ""
+
+# Step 6: First sync
+echo "--- Step 6: Initial Sync ---"
+bash "$HOME/bin/agentmesh" sync push
+echo ""
+
+echo "=== AgentMesh Init Complete ==="
+echo "Mesh ID: $MESH_ID"
+echo "Hostname: $HOSTNAME"
+echo "Memory: $MEMORY_DIR"
+echo "Sync: Every hour via cron"
+echo ""
+echo "Next steps:"
+echo "  1. Share the join token with your other machines"
+echo "  2. On each machine, run: agentmesh join <token>"
+echo "  3. Start assigning tasks: agentmesh task add ..."

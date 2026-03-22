@@ -1,0 +1,86 @@
+#!/bin/bash
+# agentmesh-status — Show mesh status
+set -euo pipefail
+
+HOSTNAME=$(hostname)
+CONFIG_DIR="$HOME/.agentmesh"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "AgentMesh: Not configured"
+    echo "Run 'agentmesh init' or 'agentmesh join' to get started."
+    exit 0
+fi
+
+MEMORY_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['memory_dir'])")
+MESH_ID=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['mesh_id'])")
+TASKS_FILE="$MEMORY_DIR/tasks.json"
+
+echo "=== AgentMesh Status ==="
+echo "Mesh ID:  $MESH_ID"
+echo "Hostname: $HOSTNAME"
+echo "Memory:   $MEMORY_DIR"
+echo ""
+
+# Machines
+echo "--- Machines ---"
+if [ -d "$MEMORY_DIR/machines" ]; then
+    for machine_dir in "$MEMORY_DIR/machines"/*/; do
+        [ -d "$machine_dir" ] || continue
+        local_name=$(basename "$machine_dir")
+        file_count=$(find "$machine_dir" -name '*.md' 2>/dev/null | wc -l)
+        marker=""
+        [ "$local_name" = "$HOSTNAME" ] && marker=" ← this machine"
+        echo "  $local_name ($file_count files)$marker"
+    done
+else
+    echo "  (no machines found)"
+fi
+echo ""
+
+# Tasks
+echo "--- Tasks ---"
+if [ -f "$TASKS_FILE" ]; then
+    python3 -c "
+import json
+with open('$TASKS_FILE') as f:
+    data = json.load(f)
+pending = [t for t in data['tasks'] if t['status'] == 'pending']
+running = [t for t in data['tasks'] if t['status'] == 'running']
+completed = [t for t in data['tasks'] if t['status'] == 'completed']
+failed = [t for t in data['tasks'] if t['status'] == 'failed']
+print(f'  Pending: {len(pending)}  Running: {len(running)}  Completed: {len(completed)}  Failed: {len(failed)}')
+for t in pending + running:
+    status = '⏳' if t['status'] == 'pending' else '🔄'
+    title = t.get('title', t.get('id', '?'))
+    machine = t.get('machine', '?')
+    print(f'  {status} {title} → {machine}')
+"
+else
+    echo "  (no tasks.json)"
+fi
+echo ""
+
+# Broadcasts
+echo "--- Broadcasts ---"
+BC_DIR="$MEMORY_DIR/broadcasts"
+if [ -d "$BC_DIR" ] && ls "$BC_DIR"/*.md &>/dev/null 2>&1; then
+    for bc in "$BC_DIR"/*.md; do
+        name=$(basename "$bc" .md)
+        done_count=$(grep -c '^\- \[x\]' "$bc" 2>/dev/null || echo 0)
+        pending_count=$(grep -c '^\- \[ \]' "$bc" 2>/dev/null || echo 0)
+        total=$((done_count + pending_count))
+        echo "  $name: $done_count/$total completed"
+    done
+else
+    echo "  (no broadcasts)"
+fi
+echo ""
+
+# Last sync
+echo "--- Last Sync ---"
+if [ -f /tmp/agentmesh.log ]; then
+    tail -1 /tmp/agentmesh.log
+else
+    echo "  (no sync log)"
+fi

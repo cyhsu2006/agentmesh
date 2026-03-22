@@ -1,0 +1,304 @@
+#!/bin/bash
+# agentmesh-runner — Task runner + broadcast processor
+# Triggered by agentmesh-sync after each sync cycle
+set -euo pipefail
+
+HOSTNAME=$(hostname)
+CONFIG_DIR="$HOME/.agentmesh"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+LOG="/tmp/agentmesh-runner.log"
+LOCK_FILE="/tmp/agentmesh-runner.lock"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: AgentMesh not configured." >&2
+    exit 1
+fi
+
+MEMORY_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['memory_dir'])")
+RCLONE_CONF=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['rclone_conf'])")
+REMOTE=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['remote'])")
+
+TASKS_FILE="$MEMORY_DIR/tasks.json"
+SPECS_DIR="$MEMORY_DIR/tasks"
+BROADCASTS_DIR="$MEMORY_DIR/broadcasts"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$HOSTNAME] $*" >> "$LOG"; }
+
+acquire_lock() {
+    if [ -f "$LOCK_FILE" ]; then
+        local pid
+        pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            log "SKIP: runner already running (pid=$pid)"
+            exit 0
+        fi
+        rm -f "$LOCK_FILE"
+    fi
+    echo $$ > "$LOCK_FILE"
+    trap 'rm -f "$LOCK_FILE"' EXIT
+}
+
+push_results() {
+    rclone copy "$MEMORY_DIR/" "$REMOTE:memory/" \
+        --update --config "$RCLONE_CONF" 2>>"$LOG" || true
+}
+
+get_task_field() {
+    echo "$1" | python3 -c "
+import json, sys
+t = json.load(sys.stdin)
+v = t.get('$2', '$3')
+print('' if v is None else v)
+"
+}
+
+update_task() {
+    local task_id="$1"
+    local updates="$2"
+    python3 << PYEOF
+import json
+from datetime import datetime, timezone, timedelta
+tz = timezone(timedelta(hours=8))
+now = datetime.now(tz).isoformat()
+with open("$TASKS_FILE") as f:
+    data = json.load(f)
+updates = json.loads('''$updates''')
+for t in data["tasks"]:
+    if t["id"] == "$task_id":
+        if updates.get("status") == "running":
+            updates["started_at"] = now
+        if updates.get("status") in ("completed", "failed"):
+            updates["completed_at"] = now
+        t.update(updates)
+        break
+with open("$TASKS_FILE", "w") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+PYEOF
+}
+
+# --- Broadcast Processing ---
+process_broadcasts() {
+    [ ! -d "$BROADCASTS_DIR" ] && return 0
+
+    for bc_file in "$BROADCASTS_DIR"/*.md; do
+        [ ! -f "$bc_file" ] && continue
+
+        # Skip if already executed
+        if grep -q "^\- \[x\] $HOSTNAME" "$bc_file" 2>/dev/null; then
+            continue
+        fi
+
+        # Skip if not in target list
+        if ! grep -q "^\- \[ \] $HOSTNAME" "$bc_file" 2>/dev/null; then
+            continue
+        fi
+
+        # Skip if expired (> 7 days)
+        local created
+        created=$(grep '^created:' "$bc_file" | head -1 | sed 's/created: *//')
+        if [ -n "$created" ]; then
+            local created_epoch now_epoch
+            created_epoch=$(date -d "$created" +%s 2>/dev/null || echo 0)
+            now_epoch=$(date +%s)
+            if [ $((now_epoch - created_epoch)) -gt 604800 ]; then
+                log "BROADCAST $(basename "$bc_file"): expired, skip"
+                continue
+            fi
+        fi
+
+        # Extract prompt from ## 指令 section
+        local prompt
+        prompt=$(python3 -c "
+lines = open('$bc_file').readlines()
+in_cmd = False
+cmd_lines = []
+for line in lines:
+    if line.strip().startswith('## 指令') or line.strip().startswith('## Command'):
+        in_cmd = True
+        continue
+    if in_cmd:
+        if line.strip().startswith('## '):
+            break
+        cmd_lines.append(line.rstrip())
+print('\n'.join(cmd_lines).strip())
+")
+
+        if [ -z "$prompt" ]; then
+            log "BROADCAST $(basename "$bc_file"): no prompt, skip"
+            continue
+        fi
+
+        log "BROADCAST $(basename "$bc_file"): executing"
+
+        local model budget project_dir
+        model=$(grep '^model:' "$bc_file" | head -1 | sed 's/model: *//' || echo "sonnet")
+        budget=$(grep '^budget:' "$bc_file" | head -1 | sed 's/budget: *//' || echo "5")
+        project_dir=$(grep '^project_dir:' "$bc_file" | head -1 | sed 's/project_dir: *//' || echo "$HOME")
+        [ -z "$model" ] && model="sonnet"
+        [ -z "$budget" ] && budget="5"
+        [ -z "$project_dir" ] && project_dir="$HOME"
+        project_dir="${project_dir/#\~/$HOME}"
+
+        local output_file="/tmp/agentmesh-broadcast-$(basename "$bc_file" .md).json"
+        local exit_code=0
+
+        cd "$project_dir" 2>/dev/null || cd "$HOME"
+
+        timeout 3600 claude -p "$prompt" \
+            --model "$model" \
+            --max-budget-usd "$budget" \
+            --permission-mode bypassPermissions \
+            --output-format json \
+            --no-session-persistence \
+            < /dev/null > "$output_file" 2>&1 || exit_code=$?
+
+        local timestamp
+        timestamp=$(date '+%Y-%m-%d %H:%M')
+        if [ $exit_code -eq 0 ]; then
+            sed -i "s/^- \[ \] $HOSTNAME.*/- [x] $HOSTNAME ($timestamp)/" "$bc_file"
+            log "BROADCAST $(basename "$bc_file"): completed"
+        else
+            sed -i "s/^- \[ \] $HOSTNAME.*/- [!] $HOSTNAME ($timestamp) exit=$exit_code/" "$bc_file"
+            log "BROADCAST $(basename "$bc_file"): failed (exit=$exit_code)"
+        fi
+
+        push_results
+        break  # One broadcast per cycle
+    done
+}
+
+# --- Task Processing ---
+process_tasks() {
+    [ ! -f "$TASKS_FILE" ] && return 0
+
+    # Check running tasks
+    local running
+    running=$(python3 -c "
+import json
+with open('$TASKS_FILE') as f:
+    data = json.load(f)
+tasks = [t for t in data['tasks'] if t.get('machine') == '$HOSTNAME' and t['status'] == 'running']
+if tasks: print(json.dumps(tasks[0]))
+" 2>/dev/null || echo "")
+
+    if [ -n "$running" ]; then
+        local pid
+        pid=$(get_task_field "$running" "pid" "")
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            log "Task still running (pid=$pid)"
+            return 0
+        fi
+    fi
+
+    # Get next pending task
+    local next_task
+    next_task=$(python3 -c "
+import json
+with open('$TASKS_FILE') as f:
+    data = json.load(f)
+tasks = [t for t in data['tasks'] if t.get('machine') == '$HOSTNAME' and t['status'] == 'pending']
+tasks.sort(key=lambda t: (t.get('priority', 0), t['created']))
+if tasks: print(json.dumps(tasks[0]))
+" 2>/dev/null || echo "")
+
+    [ -z "$next_task" ] && { log "No pending tasks"; return 0; }
+
+    local task_id project_dir spec_file model budget task_type
+    task_id=$(get_task_field "$next_task" "id" "")
+    project_dir=$(get_task_field "$next_task" "project_dir" "$HOME")
+    spec_file=$(get_task_field "$next_task" "spec_file" "")
+    model=$(get_task_field "$next_task" "model" "sonnet")
+    budget=$(get_task_field "$next_task" "max_budget_usd" "5")
+    task_type=$(get_task_field "$next_task" "type" "short")
+
+    project_dir="${project_dir/#\~/$HOME}"
+
+    # Build prompt
+    local full_prompt=""
+    if [ -n "$spec_file" ] && [ -f "$SPECS_DIR/$spec_file" ]; then
+        full_prompt="Read and execute the following task specification:
+
+$(cat "$SPECS_DIR/$spec_file")
+
+Execute the task as described. When done, summarize what you did."
+    else
+        full_prompt=$(python3 -c "
+import json
+with open('$TASKS_FILE') as f:
+    data = json.load(f)
+for t in data['tasks']:
+    if t['id'] == '$task_id':
+        print(t.get('prompt', ''))
+        break
+" 2>/dev/null || echo "")
+    fi
+
+    if [ -z "$full_prompt" ]; then
+        update_task "$task_id" '{"status":"failed","error":"No spec file or prompt found"}'
+        push_results
+        return
+    fi
+
+    log "EXEC task $task_id in $project_dir"
+    update_task "$task_id" "{\"status\":\"running\",\"pid\":$$}"
+    push_results
+
+    cd "$project_dir" || {
+        update_task "$task_id" "{\"status\":\"failed\",\"error\":\"Directory not found: $project_dir\"}"
+        push_results
+        return
+    }
+
+    local output_file="/tmp/agentmesh-task-${task_id}.json"
+    local exit_code=0
+    timeout 3600 claude -p "$full_prompt" \
+        --model "$model" \
+        --max-budget-usd "$budget" \
+        --permission-mode bypassPermissions \
+        --output-format json \
+        --no-session-persistence \
+        < /dev/null > "$output_file" 2>&1 || exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
+        python3 << PYEOF
+import json
+from datetime import datetime, timezone, timedelta
+tz = timezone(timedelta(hours=8))
+with open("$TASKS_FILE") as f:
+    data = json.load(f)
+try:
+    with open("$output_file") as f:
+        content = f.read()
+        idx = content.index("{")
+        output = json.loads(content[idx:])
+    summary = output.get("result", "Task completed")[:1000]
+    cost = output.get("total_cost_usd", 0)
+except:
+    summary = "Task completed"
+    cost = 0
+for t in data["tasks"]:
+    if t["id"] == "$task_id":
+        t["status"] = "completed"
+        t["completed_at"] = datetime.now(tz).isoformat()
+        t["summary"] = summary
+        if cost: t["cost_usd"] = round(cost, 4)
+        break
+with open("$TASKS_FILE", "w") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+PYEOF
+        log "DONE task $task_id"
+    else
+        update_task "$task_id" "{\"status\":\"failed\",\"error\":\"exit code $exit_code\"}"
+        log "FAIL task $task_id (exit=$exit_code)"
+    fi
+    push_results
+}
+
+# Main
+main() {
+    acquire_lock
+    process_broadcasts
+    process_tasks
+}
+
+main "$@"

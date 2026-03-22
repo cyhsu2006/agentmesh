@@ -1,0 +1,103 @@
+#!/bin/bash
+# agentmesh-broadcast — Send a broadcast command to all machines
+# Usage: agentmesh broadcast "指令內容"
+#    or: agentmesh broadcast --file <broadcast.md>
+set -euo pipefail
+
+HOSTNAME=$(hostname)
+CONFIG_DIR="$HOME/.agentmesh"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: AgentMesh not configured."
+    exit 1
+fi
+
+MEMORY_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['memory_dir'])")
+BROADCASTS_DIR="$MEMORY_DIR/broadcasts"
+mkdir -p "$BROADCASTS_DIR"
+
+if [ -z "${1:-}" ]; then
+    echo "Usage:"
+    echo "  agentmesh broadcast \"your command here\""
+    echo "  agentmesh broadcast --file broadcast.md"
+    echo ""
+    echo "Options:"
+    echo "  --model <model>     AI model to use (default: sonnet)"
+    echo "  --budget <usd>      Max budget in USD (default: 5)"
+    echo "  --targets <hosts>   Comma-separated hostnames (default: all known)"
+    exit 1
+fi
+
+# Parse arguments
+PROMPT=""
+MODEL="sonnet"
+BUDGET="5"
+TARGETS=""
+BC_FILE=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --file)   BC_FILE="$2"; shift 2 ;;
+        --model)  MODEL="$2"; shift 2 ;;
+        --budget) BUDGET="$2"; shift 2 ;;
+        --targets) TARGETS="$2"; shift 2 ;;
+        *)        PROMPT="$1"; shift ;;
+    esac
+done
+
+# If file provided, use it directly
+if [ -n "$BC_FILE" ]; then
+    cp "$BC_FILE" "$BROADCASTS_DIR/"
+    echo "Broadcast file copied: $(basename "$BC_FILE")"
+    echo "Run 'agentmesh sync push' to distribute."
+    exit 0
+fi
+
+if [ -z "$PROMPT" ]; then
+    echo "ERROR: No command provided."
+    exit 1
+fi
+
+# Auto-detect targets from known machines
+if [ -z "$TARGETS" ]; then
+    TARGETS=$(find "$MEMORY_DIR/machines" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | \
+              xargs -I{} basename {} | sort | tr '\n' ',' | sed 's/,$//')
+    if [ -z "$TARGETS" ]; then
+        TARGETS="$HOSTNAME"
+    fi
+fi
+
+# Generate broadcast file
+TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
+BC_NAME="${TIMESTAMP}-broadcast.md"
+CREATED_AT=$(date -Iseconds)
+
+{
+    echo "# 廣播：$PROMPT"
+    echo ""
+    echo "created: $CREATED_AT"
+    echo "created_by: $HOSTNAME"
+    echo "model: $MODEL"
+    echo "budget: $BUDGET"
+    echo ""
+    echo "## 指令"
+    echo ""
+    echo "$PROMPT"
+    echo ""
+    echo "## 已執行"
+    IFS=',' read -ra HOST_ARRAY <<< "$TARGETS"
+    for host in "${HOST_ARRAY[@]}"; do
+        host=$(echo "$host" | xargs)  # trim whitespace
+        if [ "$host" = "$HOSTNAME" ]; then
+            echo "- [x] $host ($(date '+%Y-%m-%d %H:%M') — 發起者)"
+        else
+            echo "- [ ] $host"
+        fi
+    done
+} > "$BROADCASTS_DIR/$BC_NAME"
+
+echo "Broadcast created: $BC_NAME"
+echo "Targets: $TARGETS"
+echo ""
+echo "Run 'agentmesh sync push' to distribute, or wait for next cron cycle."
