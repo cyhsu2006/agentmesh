@@ -88,8 +88,10 @@ case "${EVENT:-}" in
     *)                   PREFIX="💬" ;;
 esac
 
-# Format message with hostname
-FULL_MESSAGE="${PREFIX} [${HOSTNAME}] ${MESSAGE}"
+# Format message with hostname and timestamp
+TIMESTAMP=$(date '+%H:%M:%S')
+FULL_MESSAGE="${PREFIX} [${HOSTNAME}] ${MESSAGE}
+⏱ ${TIMESTAMP}"
 
 # Send via Telegram Bot API
 curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
