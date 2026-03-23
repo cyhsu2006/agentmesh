@@ -3,3 +3,4 @@
 /tmp/
 rclone.conf
 join-token.txt
+email.conf

@@ -1,0 +1,71 @@
+#!/bin/bash
+# agentmesh-email — Send email via Gmail SMTP
+# Usage: agentmesh-email <to> <subject> <body>
+#        echo "body" | agentmesh-email <to> <subject>
+set -euo pipefail
+
+CONFIG="$HOME/.agentmesh/email.conf"
+
+if [ ! -f "$CONFIG" ]; then
+    echo "ERROR: Email not configured. Create ~/.agentmesh/email.conf with SMTP settings." >&2
+    exit 1
+fi
+
+# Check permissions
+PERMS=$(stat -c %a "$CONFIG" 2>/dev/null || stat -f %Lp "$CONFIG" 2>/dev/null)
+if [ "$PERMS" != "600" ]; then
+    echo "WARNING: $CONFIG permissions should be 600, fixing..." >&2
+    chmod 600 "$CONFIG"
+fi
+
+# Read config
+source "$CONFIG"
+
+TO="${1:-}"
+SUBJECT="${2:-}"
+BODY="${3:-}"
+
+if [ -z "$TO" ]; then
+    echo "Usage: agentmesh-email <to> <subject> [body]"
+    echo "       echo \"body\" | agentmesh-email <to> <subject>"
+    exit 1
+fi
+
+if [ -z "$SUBJECT" ]; then
+    echo "ERROR: Subject is required." >&2
+    exit 1
+fi
+
+# If no body argument, read from stdin
+if [ -z "$BODY" ]; then
+    if [ ! -t 0 ]; then
+        BODY=$(cat)
+    else
+        echo "ERROR: No body provided. Pass as argument or pipe via stdin." >&2
+        exit 1
+    fi
+fi
+
+python3 << PYEOF
+import smtplib
+from email.mime.text import MIMEText
+from email.header import Header
+
+sender = "$SMTP_USER"
+recipient = "$TO"
+password = "$SMTP_PASS"
+
+msg = MIMEText("""$BODY""", 'plain', 'utf-8')
+msg['Subject'] = Header("""$SUBJECT""", 'utf-8')
+msg['From'] = sender
+msg['To'] = recipient
+
+try:
+    with smtplib.SMTP_SSL("$SMTP_HOST", $SMTP_PORT) as server:
+        server.login(sender, password)
+        server.sendmail(sender, recipient, msg.as_string())
+    print("OK")
+except Exception as e:
+    print(f"ERROR: {e}")
+    exit(1)
+PYEOF
