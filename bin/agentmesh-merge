@@ -1,0 +1,169 @@
+#!/bin/bash
+# agentmesh-merge — Auto-merge memory from other machines into local copy
+# Scans all machines' directories, finds new content, merges into own
+# Called by sync after pull, before push
+set -euo pipefail
+
+HOSTNAME=$(hostname)
+LOG="/tmp/agentmesh-merge.log"
+
+# Detect memory dir
+CONFIG_FILE="$HOME/.agentmesh/config.json"
+if [ -f "$CONFIG_FILE" ]; then
+    MEMORY_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['memory_dir'])")
+else
+    SANITIZED_HOME=$(echo "$HOME" | sed 's|/|-|g')
+    MEMORY_DIR="$HOME/.claude/projects/$SANITIZED_HOME/memory"
+    if [ ! -d "$MEMORY_DIR" ]; then
+        SANITIZED_HOME2=$(echo "$SANITIZED_HOME" | sed 's|^-||')
+        [ -d "$HOME/.claude/projects/$SANITIZED_HOME2/memory" ] && MEMORY_DIR="$HOME/.claude/projects/$SANITIZED_HOME2/memory"
+    fi
+fi
+
+MY_DIR="$MEMORY_DIR/machines/$HOSTNAME"
+MACHINES_DIR="$MEMORY_DIR/machines"
+
+[ ! -d "$MY_DIR" ] && { echo "No local machine dir"; exit 0; }
+[ ! -d "$MACHINES_DIR" ] && { echo "No machines dir"; exit 0; }
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$HOSTNAME] MERGE: $*" >> "$LOG"; }
+
+python3 - "$MY_DIR" "$MACHINES_DIR" "$HOSTNAME" << 'PYEOF'
+import json, os, sys, re
+from datetime import datetime
+
+my_dir = sys.argv[1]
+machines_dir = sys.argv[2]
+hostname = sys.argv[3]
+
+def read_file(path):
+    with open(path, 'r') as f:
+        return f.read()
+
+def write_file(path, content):
+    with open(path, 'w') as f:
+        f.write(content)
+
+def extract_projects(content):
+    """Extract project entries from master list. Returns dict of project_name -> full_block."""
+    projects = {}
+    current_name = None
+    current_block = []
+
+    for line in content.split('\n'):
+        # Match ### N. Name or **Name**
+        m = re.match(r'^### \d+\.\s+(.+)', line)
+        if m:
+            if current_name:
+                projects[current_name] = '\n'.join(current_block)
+            current_name = m.group(1).strip()
+            current_block = [line]
+        elif current_name:
+            if line.startswith('### ') or line.startswith('## '):
+                projects[current_name] = '\n'.join(current_block)
+                # Check if this is a new project or section header
+                m2 = re.match(r'^### \d+\.\s+(.+)', line)
+                if m2:
+                    current_name = m2.group(1).strip()
+                    current_block = [line]
+                else:
+                    current_name = None
+                    current_block = []
+            else:
+                current_block.append(line)
+
+    if current_name:
+        projects[current_name] = '\n'.join(current_block)
+
+    return projects
+
+def merge_master_list():
+    """Merge project_master_list.md from all machines."""
+    my_list = os.path.join(my_dir, 'project_master_list.md')
+    if not os.path.isfile(my_list):
+        return
+
+    my_content = read_file(my_list)
+    my_projects = extract_projects(my_content)
+    merged_any = False
+
+    for machine in sorted(os.listdir(machines_dir)):
+        if machine == hostname:
+            continue
+        their_list = os.path.join(machines_dir, machine, 'project_master_list.md')
+        if not os.path.isfile(their_list):
+            continue
+
+        their_content = read_file(their_list)
+        their_projects = extract_projects(their_content)
+
+        for name, block in their_projects.items():
+            if name not in my_projects:
+                print(f"NEW from {machine}: {name}")
+                merged_any = True
+                my_projects[name] = block
+
+    if merged_any:
+        # Find the last number in the file
+        numbers = re.findall(r'^### (\d+)\.', my_content, re.MULTILINE)
+        max_num = max(int(n) for n in numbers) if numbers else 0
+
+        # Append new projects before the --- footer
+        new_entries = []
+        for name, block in my_projects.items():
+            if name not in extract_projects(my_content):
+                max_num += 1
+                # Renumber the block
+                block = re.sub(r'^### \d+\.', f'### {max_num}.', block, count=1)
+                new_entries.append(block)
+
+        if new_entries:
+            # Insert before the last ---
+            footer_match = my_content.rfind('\n---\n')
+            if footer_match > 0:
+                new_content = my_content[:footer_match] + '\n' + '\n\n'.join(new_entries) + '\n' + my_content[footer_match:]
+            else:
+                new_content = my_content + '\n' + '\n\n'.join(new_entries)
+
+            write_file(my_list, new_content)
+            print(f"Merged {len(new_entries)} new projects into master list")
+
+def merge_memory_files():
+    """Copy memory files that exist in other machines but not in ours."""
+    my_files = set()
+    for f in os.listdir(my_dir):
+        if f.endswith('.md') or f.endswith('.json'):
+            my_files.add(f)
+
+    for machine in sorted(os.listdir(machines_dir)):
+        if machine == hostname:
+            continue
+        their_dir = os.path.join(machines_dir, machine)
+        if not os.path.isdir(their_dir):
+            continue
+
+        for f in os.listdir(their_dir):
+            if not (f.endswith('.md') or f.endswith('.json')):
+                continue
+            # Skip machine-specific files
+            if f in ('status.json', 'machine_info.md', '.merkle.json', 'ledger.jsonl', 'public.pem'):
+                continue
+            # Skip hidden files
+            if f.startswith('.'):
+                continue
+
+            if f not in my_files:
+                # New file from another machine - copy it
+                src = os.path.join(their_dir, f)
+                dst = os.path.join(my_dir, f)
+                content = read_file(src)
+                write_file(dst, content)
+                my_files.add(f)
+                print(f"COPIED from {machine}: {f}")
+
+# Run merges
+merge_master_list()
+merge_memory_files()
+PYEOF
+
+log "merge completed"
