@@ -1,0 +1,185 @@
+#!/bin/bash
+# agentmesh-merkle — Generate and compare Merkle trees for memory directories
+# Usage: agentmesh-merkle [generate|compare|diff]
+set -euo pipefail
+
+HOSTNAME=$(hostname)
+MEMORY_DIR="${AGENTMESH_MEMORY_DIR:-}"
+
+# Auto-detect memory dir
+if [ -z "$MEMORY_DIR" ]; then
+    CONFIG_FILE="$HOME/.agentmesh/config.json"
+    if [ -f "$CONFIG_FILE" ]; then
+        MEMORY_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['memory_dir'])")
+    else
+        SANITIZED_HOME=$(echo "$HOME" | sed 's|/|-|g')
+        MEMORY_DIR="$HOME/.claude/projects/$SANITIZED_HOME/memory"
+        if [ ! -d "$MEMORY_DIR" ]; then
+            SANITIZED_HOME2=$(echo "$SANITIZED_HOME" | sed 's|^-||')
+            [ -d "$HOME/.claude/projects/$SANITIZED_HOME2/memory" ] && MEMORY_DIR="$HOME/.claude/projects/$SANITIZED_HOME2/memory"
+        fi
+    fi
+fi
+
+CMD="${1:-generate}"
+
+python3 - "$CMD" "$MEMORY_DIR" "$HOSTNAME" << 'PYEOF'
+import hashlib, json, os, sys
+from pathlib import Path
+
+cmd = sys.argv[1]
+memory_dir = sys.argv[2]
+hostname = sys.argv[3]
+
+def file_hash(filepath):
+    """SHA-256 hash of file contents."""
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def build_merkle(directory):
+    """Build Merkle tree for a directory. Returns (root_hash, tree_dict)."""
+    tree = {}
+    hashes = []
+
+    for root, dirs, files in sorted(os.walk(directory)):
+        dirs.sort()
+        for fname in sorted(files):
+            if fname.startswith('.') and fname != '.sync_version':
+                continue
+            filepath = os.path.join(root, fname)
+            rel = os.path.relpath(filepath, directory)
+            fhash = file_hash(filepath)
+            tree[rel] = {
+                "hash": fhash,
+                "size": os.path.getsize(filepath)
+            }
+            hashes.append(fhash)
+
+    # Build root hash from all file hashes
+    if hashes:
+        combined = ''.join(sorted(hashes))
+        root_hash = hashlib.sha256(combined.encode()).hexdigest()
+    else:
+        root_hash = hashlib.sha256(b'empty').hexdigest()
+
+    return root_hash, tree
+
+def generate():
+    """Generate Merkle tree and save to status."""
+    machine_dir = os.path.join(memory_dir, "machines", hostname)
+    if not os.path.isdir(machine_dir):
+        print(f"ERROR: {machine_dir} not found")
+        sys.exit(1)
+
+    root_hash, tree = build_merkle(machine_dir)
+
+    merkle_file = os.path.join(machine_dir, ".merkle.json")
+    merkle_data = {
+        "hostname": hostname,
+        "root_hash": root_hash,
+        "file_count": len(tree),
+        "files": tree
+    }
+
+    with open(merkle_file, 'w') as f:
+        json.dump(merkle_data, f, indent=2)
+
+    # Update status.json with root_hash
+    status_file = os.path.join(machine_dir, "status.json")
+    if os.path.isfile(status_file):
+        with open(status_file) as f:
+            status = json.load(f)
+        status["memory_hash"] = root_hash
+        status["memory_file_count"] = len(tree)
+        with open(status_file, 'w') as f:
+            json.dump(status, f, indent=2, ensure_ascii=False)
+
+    print(f"Root hash: {root_hash[:16]}... ({len(tree)} files)")
+
+def compare():
+    """Compare Merkle roots across all machines."""
+    machines_dir = os.path.join(memory_dir, "machines")
+    results = {}
+
+    for machine in sorted(os.listdir(machines_dir)):
+        machine_path = os.path.join(machines_dir, machine)
+        if not os.path.isdir(machine_path):
+            continue
+        merkle_file = os.path.join(machine_path, ".merkle.json")
+        if os.path.isfile(merkle_file):
+            with open(merkle_file) as f:
+                data = json.load(f)
+            results[machine] = {
+                "root_hash": data["root_hash"][:16],
+                "file_count": data["file_count"]
+            }
+        else:
+            results[machine] = {"root_hash": "no merkle", "file_count": "?"}
+
+    print("Machine Merkle Comparison:")
+    for machine, info in results.items():
+        marker = " ← this" if machine == hostname else ""
+        print(f"  {machine}: {info['root_hash']}  ({info['file_count']} files){marker}")
+
+    # Check if all hashes match
+    hashes = [v["root_hash"] for v in results.values() if v["root_hash"] != "no merkle"]
+    if len(set(hashes)) <= 1:
+        print("\n✅ All machines in sync")
+    else:
+        print(f"\n⚠️  {len(set(hashes))} different versions detected")
+
+def diff():
+    """Show file-level differences between this machine and others."""
+    machines_dir = os.path.join(memory_dir, "machines")
+    my_merkle = os.path.join(machines_dir, hostname, ".merkle.json")
+
+    if not os.path.isfile(my_merkle):
+        print("Run 'agentmesh-merkle generate' first")
+        sys.exit(1)
+
+    with open(my_merkle) as f:
+        my_data = json.load(f)
+    my_files = my_data["files"]
+
+    for machine in sorted(os.listdir(machines_dir)):
+        if machine == hostname:
+            continue
+        their_merkle = os.path.join(machines_dir, machine, ".merkle.json")
+        if not os.path.isfile(their_merkle):
+            continue
+
+        with open(their_merkle) as f:
+            their_data = json.load(f)
+
+        if their_data["root_hash"] == my_data["root_hash"]:
+            print(f"\n{machine}: ✅ identical")
+            continue
+
+        their_files = their_data["files"]
+        print(f"\n{machine}: differences found")
+
+        all_files = set(list(my_files.keys()) + list(their_files.keys()))
+        for fname in sorted(all_files):
+            if fname.startswith('.'):
+                continue
+            mine = my_files.get(fname)
+            theirs = their_files.get(fname)
+            if mine and not theirs:
+                print(f"  + {fname} (only in {hostname})")
+            elif theirs and not mine:
+                print(f"  - {fname} (only in {machine})")
+            elif mine["hash"] != theirs["hash"]:
+                print(f"  ~ {fname} (different)")
+
+if cmd == "generate":
+    generate()
+elif cmd == "compare":
+    compare()
+elif cmd == "diff":
+    diff()
+else:
+    print(f"Usage: agentmesh-merkle [generate|compare|diff]")
+PYEOF

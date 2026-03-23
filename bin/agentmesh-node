@@ -1,0 +1,197 @@
+#!/bin/bash
+# agentmesh-node — Node lifecycle management (keys, leave, evict, list)
+# Usage: agentmesh-node <command> [args]
+set -euo pipefail
+
+HOSTNAME=$(hostname)
+CONFIG_DIR="$HOME/.agentmesh"
+KEYS_DIR="$CONFIG_DIR/keys"
+
+MEMORY_DIR="${AGENTMESH_MEMORY_DIR:-}"
+if [ -z "$MEMORY_DIR" ]; then
+    CONFIG_FILE="$CONFIG_DIR/config.json"
+    if [ -f "$CONFIG_FILE" ]; then
+        MEMORY_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['memory_dir'])")
+    else
+        SANITIZED_HOME=$(echo "$HOME" | sed 's|/|-|g')
+        MEMORY_DIR="$HOME/.claude/projects/$SANITIZED_HOME/memory"
+        [ ! -d "$MEMORY_DIR" ] && MEMORY_DIR="$HOME/.claude/projects/$(echo "$SANITIZED_HOME" | sed 's|^-||')/memory"
+    fi
+fi
+
+MESH_FILE="$MEMORY_DIR/mesh-members.json"
+
+CMD="${1:-list}"
+
+generate_keys() {
+    mkdir -p "$KEYS_DIR"
+    if [ -f "$KEYS_DIR/private.pem" ]; then
+        echo "Keys already exist."
+        return
+    fi
+    openssl genpkey -algorithm ED25519 -out "$KEYS_DIR/private.pem" 2>/dev/null
+    openssl pkey -in "$KEYS_DIR/private.pem" -pubout -out "$KEYS_DIR/public.pem" 2>/dev/null
+    chmod 600 "$KEYS_DIR/private.pem"
+    echo "Generated ED25519 key pair."
+}
+
+register_node() {
+    generate_keys
+
+    local pubkey
+    pubkey=$(cat "$KEYS_DIR/public.pem" | grep -v "^---" | tr -d '\n')
+
+    python3 << PYEOF
+import json, os
+from datetime import datetime, timezone, timedelta
+
+tz = timezone(timedelta(hours=8))
+now = datetime.now(tz).isoformat()
+mesh_file = "$MESH_FILE"
+
+if os.path.isfile(mesh_file):
+    with open(mesh_file) as f:
+        data = json.load(f)
+else:
+    data = {"members": {}, "evicted": []}
+
+data["members"]["$HOSTNAME"] = {
+    "public_key": "$pubkey",
+    "joined_at": now,
+    "status": "active",
+    "approved_by": "$HOSTNAME"
+}
+
+with open(mesh_file, "w") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+
+print(f"Registered $HOSTNAME in mesh")
+PYEOF
+
+    # Copy public key to machine directory for others to verify
+    local machine_dir="$MEMORY_DIR/machines/$HOSTNAME"
+    mkdir -p "$machine_dir"
+    cp "$KEYS_DIR/public.pem" "$machine_dir/public.pem"
+}
+
+leave_mesh() {
+    echo "Leaving mesh as $HOSTNAME..."
+
+    python3 << PYEOF
+import json, os
+from datetime import datetime, timezone, timedelta
+
+tz = timezone(timedelta(hours=8))
+now = datetime.now(tz).isoformat()
+mesh_file = "$MESH_FILE"
+
+if not os.path.isfile(mesh_file):
+    print("Not in any mesh.")
+    exit(0)
+
+with open(mesh_file) as f:
+    data = json.load(f)
+
+if "$HOSTNAME" in data["members"]:
+    data["members"]["$HOSTNAME"]["status"] = "departed"
+    data["members"]["$HOSTNAME"]["departed_at"] = now
+
+with open(mesh_file, "w") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+
+print(f"$HOSTNAME marked as departed. Memory preserved on other nodes.")
+PYEOF
+
+    # Notify
+    if [ -x "$HOME/bin/agentmesh-notify" ]; then
+        "$HOME/bin/agentmesh-notify" --event sync_error "$HOSTNAME 已離開 mesh"
+    fi
+}
+
+evict_node() {
+    local target="${2:?Usage: agentmesh-node evict <hostname>}"
+    echo "Evicting $target from mesh..."
+
+    python3 << PYEOF
+import json, os
+from datetime import datetime, timezone, timedelta
+
+tz = timezone(timedelta(hours=8))
+now = datetime.now(tz).isoformat()
+mesh_file = "$MESH_FILE"
+
+if not os.path.isfile(mesh_file):
+    print("No mesh file.")
+    exit(1)
+
+with open(mesh_file) as f:
+    data = json.load(f)
+
+target = "$target"
+if target in data["members"]:
+    data["members"][target]["status"] = "evicted"
+    data["members"][target]["evicted_at"] = now
+    data["members"][target]["evicted_by"] = "$HOSTNAME"
+    data["evicted"].append(target)
+
+with open(mesh_file, "w") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+
+print(f"{target} has been evicted.")
+PYEOF
+
+    if [ -x "$HOME/bin/agentmesh-notify" ]; then
+        "$HOME/bin/agentmesh-notify" --event sync_error "$target 已被 $HOSTNAME 驅逐出 mesh"
+    fi
+}
+
+list_nodes() {
+    python3 << PYEOF
+import json, os, glob
+
+mesh_file = "$MESH_FILE"
+machines_dir = "$MEMORY_DIR/machines"
+
+print("=== Mesh Members ===\n")
+
+# From mesh-members.json
+if os.path.isfile(mesh_file):
+    with open(mesh_file) as f:
+        data = json.load(f)
+    for name, info in sorted(data.get("members", {}).items()):
+        status = info.get("status", "unknown")
+        joined = info.get("joined_at", "?")[:10]
+        emoji = {"active": "🟢", "departed": "👋", "evicted": "🚫"}.get(status, "❓")
+        has_key = "🔑" if info.get("public_key") else "  "
+        print(f"  {emoji} {has_key} {name:40} {status:10} joined: {joined}")
+else:
+    print("  (no mesh-members.json, showing discovered machines)")
+
+# Also show machines found by directory
+print("\n=== Discovered Machines ===\n")
+for machine_dir in sorted(glob.glob(os.path.join(machines_dir, "*/"))):
+    name = os.path.basename(machine_dir.rstrip("/"))
+    status_file = os.path.join(machine_dir, "status.json")
+    has_status = os.path.isfile(status_file)
+    has_key = os.path.isfile(os.path.join(machine_dir, "public.pem"))
+
+    if has_status:
+        with open(status_file) as f:
+            st = json.load(f)
+        hb = st.get("heartbeat", "?")[:19]
+        sv = st.get("sync_version", "?")
+        caps = len(st.get("capabilities", []))
+        print(f"  {name:40} v{sv:>4}  hb: {hb}  caps: {caps}")
+    else:
+        print(f"  {name:40} (no status)")
+PYEOF
+}
+
+case "$CMD" in
+    register)   register_node ;;
+    leave)      leave_mesh ;;
+    evict)      evict_node "$@" ;;
+    list)       list_nodes ;;
+    keys)       generate_keys ;;
+    *)          echo "Usage: agentmesh-node [register|leave|evict|list|keys]" ;;
+esac

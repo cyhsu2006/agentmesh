@@ -1,0 +1,167 @@
+#!/bin/bash
+# agentmesh-ledger — Append-only Memory Ledger for operation tracking
+# Usage: agentmesh-ledger log <action> <file> [detail]
+#        agentmesh-ledger show [--last N]
+#        agentmesh-ledger audit [machine]
+set -euo pipefail
+
+HOSTNAME=$(hostname)
+MEMORY_DIR="${AGENTMESH_MEMORY_DIR:-}"
+
+# Auto-detect memory dir
+if [ -z "$MEMORY_DIR" ]; then
+    CONFIG_FILE="$HOME/.agentmesh/config.json"
+    if [ -f "$CONFIG_FILE" ]; then
+        MEMORY_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['memory_dir'])")
+    else
+        SANITIZED_HOME=$(echo "$HOME" | sed 's|/|-|g')
+        MEMORY_DIR="$HOME/.claude/projects/$SANITIZED_HOME/memory"
+        if [ ! -d "$MEMORY_DIR" ]; then
+            SANITIZED_HOME2=$(echo "$SANITIZED_HOME" | sed 's|^-||')
+            [ -d "$HOME/.claude/projects/$SANITIZED_HOME2/memory" ] && MEMORY_DIR="$HOME/.claude/projects/$SANITIZED_HOME2/memory"
+        fi
+    fi
+fi
+
+LEDGER_FILE="$MEMORY_DIR/machines/$HOSTNAME/ledger.jsonl"
+CMD="${1:-show}"
+
+case "$CMD" in
+    log)
+        ACTION="${2:?Usage: agentmesh-ledger log <action> <file> [detail]}"
+        FILE="${3:-}"
+        DETAIL="${4:-}"
+
+        # Calculate file hash if file exists
+        FILE_HASH=""
+        if [ -n "$FILE" ] && [ -f "$MEMORY_DIR/$FILE" ] 2>/dev/null; then
+            FILE_HASH=$(sha256sum "$MEMORY_DIR/$FILE" 2>/dev/null | cut -d' ' -f1 || echo "")
+        elif [ -n "$FILE" ] && [ -f "$FILE" ] 2>/dev/null; then
+            FILE_HASH=$(sha256sum "$FILE" 2>/dev/null | cut -d' ' -f1 || echo "")
+        fi
+
+        # Get prev hash (last line's hash)
+        PREV_HASH=""
+        if [ -f "$LEDGER_FILE" ]; then
+            PREV_HASH=$(tail -1 "$LEDGER_FILE" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('entry_hash',''))" 2>/dev/null || echo "")
+        fi
+
+        # Create entry
+        python3 << PYEOF
+import json, hashlib
+from datetime import datetime, timezone, timedelta
+
+tz = timezone(timedelta(hours=8))
+
+entry = {
+    "timestamp": datetime.now(tz).isoformat(),
+    "machine": "$HOSTNAME",
+    "action": "$ACTION",
+    "file": "$FILE",
+    "file_hash": "$FILE_HASH",
+    "detail": "$DETAIL",
+    "prev_hash": "$PREV_HASH"
+}
+
+# Calculate entry hash (chain link)
+entry_str = json.dumps(entry, sort_keys=True)
+entry["entry_hash"] = hashlib.sha256(entry_str.encode()).hexdigest()[:32]
+
+import os
+os.makedirs(os.path.dirname("$LEDGER_FILE"), exist_ok=True)
+
+with open("$LEDGER_FILE", "a") as f:
+    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+PYEOF
+        ;;
+
+    show)
+        LAST="${2:-20}"
+        if [ -f "$LEDGER_FILE" ]; then
+            echo "=== Ledger: $HOSTNAME (last $LAST entries) ==="
+            tail -"$LAST" "$LEDGER_FILE" | python3 -c "
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    e = json.loads(line)
+    ts = e['timestamp'][11:19]
+    action = e['action']
+    file = e.get('file', '')
+    detail = e.get('detail', '')
+    hash_short = e.get('entry_hash', '')[:8]
+    print(f'  [{ts}] {action:12} {file:40} {detail[:30]:30} #{hash_short}')
+"
+        else
+            echo "No ledger entries yet."
+        fi
+        ;;
+
+    audit)
+        TARGET="${2:-}"
+        python3 - "$MEMORY_DIR" "$HOSTNAME" "$TARGET" << 'PYEOF'
+import json, os, sys, glob
+
+memory_dir = sys.argv[1]
+hostname = sys.argv[2]
+target = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
+machines_dir = os.path.join(memory_dir, "machines")
+
+# Read all ledgers
+ledgers = {}
+for ledger_file in glob.glob(os.path.join(machines_dir, "*/ledger.jsonl")):
+    machine = os.path.basename(os.path.dirname(ledger_file))
+    if target and machine != target:
+        continue
+    entries = []
+    with open(ledger_file) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+    ledgers[machine] = entries
+
+if not ledgers:
+    print("No ledgers found.")
+    sys.exit(0)
+
+print("=== Ledger Audit ===\n")
+
+for machine, entries in sorted(ledgers.items()):
+    marker = " ← this" if machine == hostname else ""
+    print(f"{machine}{marker}: {len(entries)} entries")
+
+    # Verify chain integrity
+    broken = 0
+    for i in range(1, len(entries)):
+        if entries[i].get("prev_hash") != entries[i-1].get("entry_hash"):
+            broken += 1
+
+    if broken:
+        print(f"  ⚠️  {broken} broken chain links!")
+    else:
+        print(f"  ✅ Chain integrity verified")
+
+    # Show last 3 entries
+    for e in entries[-3:]:
+        ts = e['timestamp'][11:19]
+        print(f"  [{ts}] {e['action']} {e.get('file', '')}")
+    print()
+
+# Cross-check: do all machines have similar operation counts?
+if len(ledgers) >= 2:
+    counts = {m: len(e) for m, e in ledgers.items()}
+    max_c = max(counts.values())
+    min_c = min(counts.values())
+    if max_c - min_c > 20:
+        print(f"⚠️  Operation count divergence: {dict(counts)}")
+    else:
+        print(f"✅ Operation counts within normal range: {dict(counts)}")
+
+PYEOF
+        ;;
+
+    *)
+        echo "Usage: agentmesh-ledger [log|show|audit] [args]"
+        ;;
+esac
