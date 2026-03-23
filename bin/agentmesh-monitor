@@ -1,0 +1,117 @@
+#!/bin/bash
+# agentmesh-monitor — Check heartbeats and alert on stale machines
+# Called by sync after each cycle
+set -euo pipefail
+
+HOSTNAME=$(hostname)
+CONFIG_DIR="$HOME/.agentmesh"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+
+# Detect memory dir
+if [ -f "$CONFIG_FILE" ]; then
+    MEMORY_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['memory_dir'])")
+else
+    SANITIZED_HOME=$(echo "$HOME" | sed 's|/|-|g')
+    MEMORY_DIR="$HOME/.claude/projects/$SANITIZED_HOME/memory"
+    if [ ! -d "$MEMORY_DIR" ]; then
+        SANITIZED_HOME2=$(echo "$SANITIZED_HOME" | sed 's|^-||')
+        [ -d "$HOME/.claude/projects/$SANITIZED_HOME2/memory" ] && MEMORY_DIR="$HOME/.claude/projects/$SANITIZED_HOME2/memory"
+    fi
+fi
+
+STATUS_DIR="$MEMORY_DIR/machines"
+ALERT_THRESHOLD=1620  # 27 minutes (3 sync cycles of 9 min)
+ALERT_STATE="$HOME/.agentmesh/.monitor_alerts"
+LOG="/tmp/agentmesh-monitor.log"
+
+mkdir -p "$(dirname "$ALERT_STATE")"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$HOSTNAME] $*" >> "$LOG"; }
+
+notify() {
+    if [ -x "$HOME/bin/agentmesh-notify" ]; then
+        "$HOME/bin/agentmesh-notify" --event "$1" "$2" &
+    fi
+}
+
+NOW=$(date +%s)
+
+for machine_dir in "$STATUS_DIR"/*/; do
+    [ -d "$machine_dir" ] || continue
+    machine=$(basename "$machine_dir")
+    [ "$machine" = "$HOSTNAME" ] && continue  # Don't monitor self
+
+    status_file="$machine_dir/status.json"
+    [ ! -f "$status_file" ] && continue
+
+    # Read heartbeat
+    heartbeat=$(python3 -c "
+import json
+from datetime import datetime
+try:
+    with open('$status_file') as f:
+        data = json.load(f)
+    hb = data.get('heartbeat', '')
+    if hb:
+        # Parse ISO format
+        dt = datetime.fromisoformat(hb)
+        print(int(dt.timestamp()))
+    else:
+        print(0)
+except:
+    print(0)
+" 2>/dev/null)
+
+    [ -z "$heartbeat" ] || [ "$heartbeat" = "0" ] && continue
+
+    elapsed=$((NOW - heartbeat))
+
+    if [ "$elapsed" -gt "$ALERT_THRESHOLD" ]; then
+        # Check if we already alerted for this machine recently
+        alert_key="${machine}_offline"
+        last_alert=0
+        if [ -f "$ALERT_STATE" ]; then
+            last_alert=$(grep "^$alert_key=" "$ALERT_STATE" 2>/dev/null | cut -d= -f2 || echo 0)
+        fi
+
+        # Only alert once per hour
+        if [ $((NOW - last_alert)) -gt 3600 ]; then
+            elapsed_min=$((elapsed / 60))
+            notify sync_error "$machine 已 ${elapsed_min} 分鐘未同步，可能離線或同步故障"
+            log "ALERT: $machine offline for ${elapsed_min} minutes"
+
+            # Record alert time
+            grep -v "^$alert_key=" "$ALERT_STATE" 2>/dev/null > "${ALERT_STATE}.tmp" || true
+            echo "$alert_key=$NOW" >> "${ALERT_STATE}.tmp"
+            mv "${ALERT_STATE}.tmp" "$ALERT_STATE"
+        fi
+    fi
+done
+
+# Version check: compare sync_versions
+python3 << PYEOF
+import json, os, glob
+
+status_dir = "$STATUS_DIR"
+hostname = "$HOSTNAME"
+machines = {}
+
+for status_file in glob.glob(os.path.join(status_dir, "*/status.json")):
+    try:
+        with open(status_file) as f:
+            data = json.load(f)
+        name = data.get("hostname", os.path.basename(os.path.dirname(status_file)))
+        machines[name] = data.get("sync_version", 0)
+    except:
+        pass
+
+if len(machines) >= 2:
+    versions = list(machines.values())
+    max_v = max(versions)
+    min_v = min(versions)
+    if max_v - min_v > 10:
+        lagging = [f"{m}(v{v})" for m, v in machines.items() if v < max_v - 5]
+        if lagging:
+            with open("/tmp/agentmesh-monitor.log", "a") as f:
+                f.write(f"VERSION LAG: {', '.join(lagging)} behind (max={max_v})\n")
+PYEOF

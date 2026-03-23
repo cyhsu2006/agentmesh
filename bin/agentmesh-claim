@@ -1,0 +1,112 @@
+#!/bin/bash
+# agentmesh-claim — Auto-claim unassigned tasks based on capabilities and load
+# Called by task-runner before processing tasks
+set -euo pipefail
+
+HOSTNAME=$(hostname)
+
+MEMORY_DIR="${1:?Usage: agentmesh-claim <memory_dir>}"
+TASKS_FILE="$MEMORY_DIR/tasks.json"
+STATUS_DIR="$MEMORY_DIR/machines"
+LOG="/tmp/agentmesh-runner.log"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$HOSTNAME] $*" >> "${LOG:-/dev/null}"; }
+
+[ ! -f "$TASKS_FILE" ] && exit 0
+
+# Read own capabilities
+OWN_STATUS="$STATUS_DIR/$HOSTNAME/status.json"
+if [ ! -f "$OWN_STATUS" ]; then
+    log "CLAIM: no status.json, skip"
+    exit 0
+fi
+
+python3 << 'PYEOF'
+import json, os, sys
+
+hostname = os.environ.get("HOSTNAME", "") or os.popen("hostname").read().strip()
+memory_dir = sys.argv[1] if len(sys.argv) > 1 else ""
+tasks_file = os.path.join(memory_dir, "tasks.json")
+status_dir = os.path.join(memory_dir, "machines")
+own_status_file = os.path.join(status_dir, hostname, "status.json")
+
+# Read own capabilities and load
+with open(own_status_file) as f:
+    own_status = json.load(f)
+
+my_caps = set(own_status.get("capabilities", []))
+my_running = own_status.get("load", {}).get("running_tasks", 0)
+max_concurrent = 2  # configurable
+
+if my_running >= max_concurrent:
+    print(f"SKIP: already running {my_running} tasks (max {max_concurrent})")
+    sys.exit(0)
+
+# Read tasks
+with open(tasks_file) as f:
+    data = json.load(f)
+
+claimed = False
+for task in data["tasks"]:
+    if task["status"] != "pending":
+        continue
+
+    machine = task.get("machine")
+
+    # Skip if already assigned to a specific machine
+    if machine and machine != "null" and machine != "any":
+        continue
+
+    # Check requirements
+    requires = task.get("requires", [])
+    if requires:
+        missing = [r for r in requires if r not in my_caps]
+        if missing:
+            continue  # Don't have required capabilities
+
+    # Check if another machine already claimed (in claim file)
+    claim_dir = os.path.join(memory_dir, "claims")
+    claim_file = os.path.join(claim_dir, f"{task['id']}.json")
+
+    if os.path.isfile(claim_file):
+        with open(claim_file) as f:
+            existing_claim = json.load(f)
+        if existing_claim.get("hostname") != hostname:
+            # Someone else claimed, check if they have higher priority
+            # (lower running_tasks = higher priority)
+            their_running = existing_claim.get("running_tasks", 0)
+            if their_running <= my_running:
+                continue  # They have equal or better priority, yield
+            # We have better priority, override claim
+
+    # Claim this task
+    os.makedirs(claim_dir, exist_ok=True)
+
+    # Calculate capability score (more matching caps = higher score)
+    cap_score = len([r for r in requires if r in my_caps]) if requires else len(my_caps)
+
+    claim_data = {
+        "hostname": hostname,
+        "claimed_at": own_status.get("heartbeat", ""),
+        "running_tasks": my_running,
+        "capability_score": cap_score,
+        "sync_version": own_status.get("sync_version", 0)
+    }
+
+    with open(claim_file, "w") as f:
+        json.dump(claim_data, f, indent=2)
+
+    # Assign task to self
+    task["machine"] = hostname
+    claimed = True
+    print(f"CLAIMED: {task['id']} ({task.get('title', '?')})")
+
+    my_running += 1
+    if my_running >= max_concurrent:
+        break
+
+if claimed:
+    with open(tasks_file, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+PYEOF

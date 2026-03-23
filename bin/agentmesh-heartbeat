@@ -1,0 +1,177 @@
+#!/bin/bash
+# agentmesh-heartbeat — Update machine status (heartbeat, capabilities, load)
+# Called by agentmesh-sync on every sync cycle
+set -euo pipefail
+
+HOSTNAME=$(hostname)
+CONFIG_DIR="$HOME/.agentmesh"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+
+# Fallback: detect memory dir directly if no agentmesh config
+if [ -f "$CONFIG_FILE" ]; then
+    MEMORY_DIR=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['memory_dir'])")
+else
+    SANITIZED_HOME=$(echo "$HOME" | sed 's|/|-|g')
+    MEMORY_DIR="$HOME/.claude/projects/$SANITIZED_HOME/memory"
+    if [ ! -d "$MEMORY_DIR" ]; then
+        SANITIZED_HOME2=$(echo "$SANITIZED_HOME" | sed 's|^-||')
+        if [ -d "$HOME/.claude/projects/$SANITIZED_HOME2/memory" ]; then
+            MEMORY_DIR="$HOME/.claude/projects/$SANITIZED_HOME2/memory"
+        else
+            FOUND=$(find "$HOME/.claude/projects" -maxdepth 2 -name "memory" -type d 2>/dev/null | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2-)
+            [ -n "$FOUND" ] && MEMORY_DIR="$FOUND"
+        fi
+    fi
+fi
+
+STATUS_FILE="$MEMORY_DIR/machines/$HOSTNAME/status.json"
+VERSION_FILE="$MEMORY_DIR/machines/$HOSTNAME/.sync_version"
+
+mkdir -p "$(dirname "$STATUS_FILE")"
+
+# Read current sync_version and increment
+if [ -f "$VERSION_FILE" ]; then
+    SYNC_VERSION=$(cat "$VERSION_FILE")
+    SYNC_VERSION=$((SYNC_VERSION + 1))
+else
+    SYNC_VERSION=1
+fi
+echo "$SYNC_VERSION" > "$VERSION_FILE"
+
+# Collect system info
+python3 << PYEOF
+import json, os, subprocess, time
+from datetime import datetime, timezone, timedelta
+
+tz = timezone(timedelta(hours=8))
+now = datetime.now(tz).isoformat()
+
+hostname = "$HOSTNAME"
+sync_version = $SYNC_VERSION
+
+# CPU usage
+try:
+    load1, load5, load15 = os.getloadavg()
+    cpu_count = os.cpu_count() or 1
+    cpu_usage_pct = round(load1 / cpu_count * 100, 1)
+except:
+    cpu_usage_pct = -1
+
+# RAM usage
+try:
+    with open('/proc/meminfo') as f:
+        meminfo = {}
+        for line in f:
+            parts = line.split()
+            meminfo[parts[0].rstrip(':')] = int(parts[1])
+    total_mb = meminfo['MemTotal'] // 1024
+    avail_mb = meminfo.get('MemAvailable', meminfo.get('MemFree', 0)) // 1024
+    ram_usage_pct = round((1 - avail_mb / total_mb) * 100, 1)
+except:
+    total_mb = 0
+    avail_mb = 0
+    ram_usage_pct = -1
+
+# GPU info
+gpus = []
+try:
+    result = subprocess.run(
+        ['nvidia-smi', '--query-gpu=name,memory.total,memory.used,utilization.gpu',
+         '--format=csv,noheader,nounits'],
+        capture_output=True, text=True, timeout=5)
+    if result.returncode == 0:
+        for line in result.stdout.strip().split('\n'):
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) >= 4:
+                gpus.append({
+                    "name": parts[0],
+                    "vram_total_mb": int(parts[1]),
+                    "vram_used_mb": int(parts[2]),
+                    "gpu_util_pct": int(parts[3])
+                })
+except:
+    pass
+
+# Capabilities: detect installed environments
+capabilities = []
+
+# GPU capabilities
+for gpu in gpus:
+    gpu_tag = gpu["name"].lower().replace(" ", "-")
+    capabilities.append(f"gpu:{gpu_tag}")
+if gpus:
+    capabilities.append("gpu")
+
+# Detect installed environments by checking common project dirs
+env_dirs = {
+    "mattergen": ["Projects/mattergen", "mattergen"],
+    "isaac-sim": ["isaac-sim", "Projects/isaac-sim"],
+    "oven-thermal-sim": ["Projects/oven-thermal-sim"],
+    "robot-arm": ["Projects/robot-arm"],
+    "hw-monitor": ["Projects/hw-monitor", "hw-monitor"],
+}
+
+home = os.path.expanduser("~")
+for env_name, paths in env_dirs.items():
+    for p in paths:
+        if os.path.isdir(os.path.join(home, p)):
+            capabilities.append(f"env:{env_name}")
+            break
+
+# Check for python, docker, ollama
+for cmd in ["docker", "ollama"]:
+    try:
+        subprocess.run(["which", cmd], capture_output=True, timeout=3)
+        capabilities.append(f"tool:{cmd}")
+    except:
+        pass
+
+# Running tasks count
+running_tasks = 0
+try:
+    tasks_file = os.path.join("$MEMORY_DIR", "tasks.json")
+    if os.path.isfile(tasks_file):
+        with open(tasks_file) as f:
+            data = json.load(f)
+        running_tasks = len([t for t in data.get("tasks", [])
+                           if t.get("machine") == hostname and t.get("status") == "running"])
+except:
+    pass
+
+# Memory hash (simple: count + total size)
+memory_dir = "$MEMORY_DIR/machines/$HOSTNAME"
+file_count = 0
+total_size = 0
+try:
+    for root, dirs, files in os.walk(memory_dir):
+        for f in files:
+            if f.endswith('.md') or f.endswith('.json'):
+                fp = os.path.join(root, f)
+                file_count += 1
+                total_size += os.path.getsize(fp)
+except:
+    pass
+
+status = {
+    "hostname": hostname,
+    "heartbeat": now,
+    "sync_version": sync_version,
+    "uptime_hours": round((time.time() - float(open('/proc/uptime').read().split()[0].replace(',','.'))) / 3600, 1) if os.path.exists('/proc/uptime') else -1,
+    "load": {
+        "cpu_usage_pct": cpu_usage_pct,
+        "ram_total_mb": total_mb,
+        "ram_available_mb": avail_mb,
+        "ram_usage_pct": ram_usage_pct,
+        "running_tasks": running_tasks
+    },
+    "gpus": gpus,
+    "capabilities": sorted(set(capabilities)),
+    "memory_stats": {
+        "file_count": file_count,
+        "total_size_bytes": total_size
+    }
+}
+
+with open("$STATUS_FILE", "w") as f:
+    json.dump(status, f, indent=2, ensure_ascii=False)
+PYEOF
