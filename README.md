@@ -1,6 +1,8 @@
 # AgentMesh
 
-A cloud-synchronized distributed AI agent framework. Connect AI agents across multiple machines using file-based communication over encrypted cloud storage.
+[![DOI](https://zenodo.org/badge/1188458268.svg)](https://doi.org/10.5281/zenodo.19176144)
+
+A blockchain-inspired distributed AI agent framework secured by MemoryChain. Connect AI agents across multiple machines using file-based communication over encrypted cloud storage.
 
 ## What is AgentMesh?
 
