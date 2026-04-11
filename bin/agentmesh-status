@@ -67,9 +67,11 @@ BC_DIR="$MEMORY_DIR/broadcasts"
 if [ -d "$BC_DIR" ] && ls "$BC_DIR"/*.md &>/dev/null 2>&1; then
     for bc in "$BC_DIR"/*.md; do
         name=$(basename "$bc" .md)
-        done_count=$(grep -c '^\- \[x\]' "$bc" 2>/dev/null || echo 0)
-        pending_count=$(grep -c '^\- \[ \]' "$bc" 2>/dev/null || echo 0)
-        total=$((done_count + pending_count))
+        done_count=$(grep -c '^\- \[x\]' "$bc" 2>/dev/null || true)
+        done_count=${done_count:-0}
+        pending_count=$(grep -c '^\- \[ \]' "$bc" 2>/dev/null || true)
+        pending_count=${pending_count:-0}
+        total=$(( done_count + pending_count ))
         echo "  $name: $done_count/$total completed"
     done
 else
